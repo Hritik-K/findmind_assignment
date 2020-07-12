@@ -165,7 +165,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
 @app.get("/tasks")
 async def show_tasks(token:str = Depends(oauth2_scheme)):
     user = await get_current_user(token)
-    cursor = tasks.find({"owner": (user["_id"])})
+    cursor = tasks.find({"owner": str(user["_id"])})
     result = []
     for doc in await cursor.to_list(length=10):
         doc["_id"] = str(doc["_id"])
@@ -191,22 +191,20 @@ async def show_task(task_id: str, token:str = Depends(oauth2_scheme)):
 @app.post("/tasks")
 async def create_task(task: Task, token:str = Depends(oauth2_scheme)):
     user = await get_current_user(token)
-    document = {"name": task.name, "due_date": task.due_date, "owner": str(user["_id"])}
+    document = {"name": task.name, "due_date": task.due_date, "owner": str(user["_id"]), "shared_to": []}
     result = await tasks.insert_one(document)
     if not result.acknowledged:
         return "Could not add task"
-    my_tasks = user["own_tasks"].append(str(result.inserted_id))
-    users.update_one({"_id": user["_id"]}, {"$set": {"own_tasks": my_tasks}})
+    users.update_one({"_id": user["_id"]}, {"$push": {"own_tasks": str(result.inserted_id)}})
     return "Task added"
 
 @app.put("/tasks/{task_id}")
 async def update_task(task_id: str, task_update: dict, token:str = Depends(oauth2_scheme)):
     user = await get_current_user(token)
-    if task_id not in user["own_tasks"] or task_id not in user["shared_to"]:
+    if (task_id not in user["own_tasks"]) and (task_id not in user["shared_tasks"]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="You do not have access to this task",
-            headers={"WWW-Authenticate": "Bearer"},
         )
     document = await tasks.update_one({"_id": ObjectId(task_id)},
                                       {"$set": task_update})
@@ -216,18 +214,37 @@ async def update_task(task_id: str, task_update: dict, token:str = Depends(oauth
         return "Could not update task: " + task_id
     return document.raw_result
 
-
 @app.delete("/task/{task_id}")
 async def delete_task(task_id: str, token:str = Depends(oauth2_scheme)):
     user = await get_current_user(token)
-    if task_id not in user["own_tasks"] or task_id not in user["shared_to"]:
+    if task_id not in user["own_tasks"]:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="You do not have access to this task",
-            headers={"WWW-Authenticate": "Bearer"},
+            detail="You can delete only your own task",
         )
+    result = await tasks.find_one({"_id": ObjectId(task_id)})
+    for user_id in result["shared_to"]:
+        users.update_one({"_id": ObjectId(user_id)}, {"$pull": {"shared_tasks": task_id}})
+    users.update_one({"_id": ObjectId(result["_id"])}, {"$pull": {"own_tasks": task_id}})
     result = await tasks.delete_one({ "_id": ObjectId(task_id) })
     if(result.raw_result["n"] == 0):
         return "Task with task_id: " + task_id + " does not exist"
     return "Task " + task_id + " deleted"
+
+@app.post("/tasks/{task_id}/share")
+async def share_task(task_id: str, share_with: str, token:str = Depends(oauth2_scheme)):
+    user = await get_current_user(token)
+    if task_id not in user["own_tasks"]:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="You cannot share this task",
+        )
+    result = await users.update_one({"_id": ObjectId(share_with)}, {"$push": {"tasks_shared": task_id}})
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Given user doesn't exist",
+        )
+    result = await tasks.update_one({"_id": task_id}, {"$push": {"shared_to": str(result.upserted_id)}})
+    return "Task shared with user: " + share_with
 
